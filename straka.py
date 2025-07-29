@@ -13,9 +13,6 @@ from snapy import (
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
-# torch.set_num_threads(1)
-# torch.set_num_interop_threads(1)
-
 p0 = 1.0e5
 Ts = 300.0
 xc = 0.0
@@ -33,13 +30,12 @@ op = MeshBlockOptions.from_yaml("straka.yaml");
 
 # initialize block
 block = MeshBlock(op)
-block.to(torch.device("cuda:0"))
+block.to(dtype=torch.float64, device=torch.device("cpu"))
 
 # get handles to modules
 coord = block.hydro.module("coord")
 eos = block.hydro.module("eos")
 thermo = eos.named_modules()["thermo"]
-
 
 # thermodynamics
 Rd = kintera.constants.Rgas / kintera.species_weights()[0];

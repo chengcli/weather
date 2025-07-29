@@ -1,117 +1,162 @@
 import torch
 import math
 import time
+import kintera
 import numpy as np
 from snapy import (
+        index,
         MeshBlockOptions,
-        MeshBlock
+        MeshBlock,
+        OutputOptions,
+        NetcdfOutput,
         )
-from kintera import ThermoX
+from kintera import (
+        ThermoOptions,
+        ThermoX,
+        KineticsOptions,
+        Kinetics,
+        )
 
 torch.set_default_dtype(torch.float64)
 
-# parameters
-Ts = 300.
-Ps = 1.e5
-Tmin = 110.
-grav = 9.8
-xH2O = 0.02
+def evolve_kinetics(block, kinet, thermo_x):
+    eos = block.hydro.module("eos")
+    thermo_y = eos.named_modules()["thermo"]
 
-# set hydrodynamic options
-op = MeshBlockOptions.from_yaml("earth.yaml");
-print(op)
+    w = block.buffer("hydro.eos.W")
 
-# initialize block
-block = MeshBlock(op)
-block.to(torch.device("cuda:0"))
+    temp = eos.compute("W->T", (w,))
+    pres = w[index.ipr]
+    xfrac = thermo_y.compute("Y->X", (w[ICY:],))
+    conc = thermo_x.compute("TPX->V", (temp, pres, xfrac))
+    cp_vol = thermo_x.compute("TV->cp", (temp, conc))
 
-# get handles to modules
-coord = block.hydro.module("coord")
-eos = block.hydro.module("eos")
-thermo_y = eos.named_modules()["thermo"]
+    conc_kinet = kinet.options.narrow_copy(conc, thermo_y.options)
+    rate, rc_ddC, rd_ddT = kinet.forward(temp, pres, conc_kinet)
+    jac = kinet.jacobian(temp, conc_kinet, cp_vol, rate, rc_ddC, rc_ddT)
 
-# get coordinates
-x3v, x2v, x1v = torch.meshgrid(
-    coord.buffer("x3v"), coord.buffer("x2v"), coord.buffer("x1v"), indexing="ij"
-)
+    stoich = kinet.buffer("stoich")
+    del_conc = kintera.evolve_implicit(rate, stoich, jac, dt)
 
-# get primitive variable
-w = block.buffer("hydro.eos.W")
+    inv_mu = thermo_y.buffer("inv_mu")
+    del_rho = del_conc / inv_mu[1:].view((1, 1, 1, -1))
+    return del_rho.permute((3, 0, 1, 2))
 
-# get dimensions
-nc3, nc2, nc1 = x1v.shape
-ny = len(thermo_y.options.species()) - 1
+def setup_initial_condition(block, thermo_x):
+    Ts = 300.
+    Ps = 1.e5
+    xH2O = 0.02
+    Tmin = 110.
+    grav = 9.8
 
-temp = Ts * torch.ones(nc3, nc2)
-pres = Ps * torch.ones(nc3, nc2)
-xfrac = torch.ones(nc3, nc2, 1)
-xfrac /= xfrac.sum(-1, keepdim=True)
-print(xfrac)
+    # get handles to modules
+    coord = block.hydro.module("coord")
+    eos = block.hydro.module("eos")
+    thermo_y = eos.named_modules()["thermo"]
 
-# half a grid to cell center
-dz = 0.;
+    # get coordinates
+    x3v, x2v, x1v = torch.meshgrid(
+        coord.buffer("x3v"), coord.buffer("x2v"), coord.buffer("x1v"), indexing="ij"
+    )
 
-thermo_x = ThermoX(thermo_y.options)
-thermo_x.extrapolate_ad(temp, pres, xfrac, grav, dz);
+    # get dimensions
+    nc3, nc2, nc1 = x1v.shape
+    ny = len(thermo_y.options.species()) - 1
+    print('ny = ', ny)
 
+    w = block.buffer("hydro.eos.W")
 
-temp = Ts - grav * x1v / cp
-w[index.ipr] = p0 * torch.pow(temp / Ts, cp / Rd)
-tempv = temp.clone()
+    temp = Ts * torch.ones((nc3, nc2), dtype=w.dtype, device=w.device)
+    pres = Ps * torch.ones((nc3, nc2), dtype=w.dtype, device=w.device)
 
-L = torch.sqrt(((x2v - xc) / xr)**2 + ((x1v - zc) / zr)**2)
-tempv *= torch.where(L <= 1, 1. + dT * cos(np.pi * L / 2.)**2 / 300., 1.0)
+    iH2O = thermo_y.options.species().index("H2O")
+    print('iH2O = ', iH2O)
 
-w[index.idn] = w[index.ipr] / (Rd * temp)
+    xfrac = torch.zeros((nc3, nc2, ny + 1), dtype=w.dtype, device=w.device)
+    xfrac[..., iH2O] = xH2O
 
-block.initialize(w)
+    # dry air mole fraction
+    xfrac[..., 0] = 1. - xH2O
 
-# make output
-# out1 = AsciiOutput(OutputOptions().file_basename("robert").fid(1).variable("hst"))
-out2 = NetcdfOutput(OutputOptions().file_basename("robert").fid(2).variable("prim"))
-out3 = NetcdfOutput(OutputOptions().file_basename("robert").fid(3).variable("uov"))
-current_time = 0.0
+    # start and end indices for the vertical direction
+    ifirst = coord.ifirst()
+    ilast = coord.ilast()
 
-block.set_uov("temp", temp)
-block.set_uov("theta", temp * (p0 / w[index.ipr]).pow(Rd / cp))
-block.set_entropy("entropy", w[index.ipr], w[index.idn])
+    # vertical grid distance of the first cell
+    dz = coord.buffer("dx1f")[ifirst]
 
-exit()
+    # half a grid to cell center
+    thermo_x.extrapolate_ad(temp, pres, xfrac, grav, dz);
 
-for out in [out2, out3]:
-    out.write_output_file(block, current_time)
-    out.combine_blocks()
+    # adiabatic extrapolation
+    for i in range(ifirst, ilast):
+        conc = thermo_x.compute("TPX->V", (temp, pres, xfrac))
 
-# integration
-count = 0
-start_time = time.time()
-interior = block.part((0, 0, 0))
-dt_max = 0.
+        w[index.ipr, ..., i] = pres;
+        w[index.idn, ..., i] = thermo_x.compute("V->D", (conc,))
+        w[index.icy:,...,i] = thermo_x.compute("X->Y", (xfrac,))
 
-while not block.intg.stop(count, current_time):
-    dt = block.max_time_step()
-    for stage in range(len(block.intg.stages)):
-        block.forward(dt, stage)
-    dt_max = max(dt_max, dt)
+        dz = coord.buffer("dx1f")[i]
+        thermo_x.extrapolate_ad(temp, pres, xfrac, grav, dz);
 
-    current_time += dt
-    count += 1
-    if count % 1000 == 0:
-        print("time = ", current_time)
-        print("dt_max = ", dt_max)
+    # initialize hydro state
+    block.initialize(w)
+    return w
+
+if __name__ == '__main__':
+    # input file
+    infile = "earth.yaml"
+    device = "cpu"
+
+    # create meshblock
+    op_block = MeshBlockOptions.from_yaml(infile)
+    block = MeshBlock(op_block)
+    block.to(device)
+
+    # create thermo module
+    op_thermo = ThermoOptions.from_yaml(infile)
+    thermo_x = ThermoX(op_thermo)
+    thermo_x.to(device)
+
+    # create kinetics module
+    op_kinet = KineticsOptions.from_yaml(infile)
+    kinet = Kinetics(op_kinet)
+    kinet.to(device)
+
+    # create output fields
+    op_out = OutputOptions().file_basename("earth")
+    out2 = NetcdfOutput(op_out.fid(2).variable("prim"))
+    out3 = NetcdfOutput(op_out.fid(3).variable("uov"))
+    out4 = NetcdfOutput(op_out.fid(4).variable("diag"))
+    outs = [out2, out3, out4]
+
+    # set up initial condition
+    w = setup_initial_condition(block, thermo_x)
+    print("w = ", w[:,0,0,:])
+
+    # integration
+    current_time = 0.0
+    count = 0
+    start_time = time.time()
+    interior = block.part((0, 0, 0))
+    while not block.intg.stop(count, current_time):
+        dt = block.max_time_step()
         u = block.buffer("hydro.eos.U")
-        print("mass = ", u[interior][index.idn].sum())
 
-        ivol = thermo.compute("DY->V", (w[index.idn], w[index.icy:]))
-        temp = thermo.compute("PV->T", (w[index.ipr], ivol))
+        if count % 1 == 0:
+            print(f"count = {count}, dt = {dt}, time = {current_time}")
+            print("mass = ", u[interior][index.idn].sum())
 
-        block.set_uov("temp", temp)
-        block.set_uov("theta", temp * (p0 / w[index.ipr]).pow(Rd / cp))
+            for out in outs:
+                out.increment_file_number()
+                out.write_output_file(block, current_time)
+                out.combine_blocks()
 
-        for out in [out2, out3]:
-            out.increment_file_number()
-            out.write_output_file(block, current_time)
-            out.combine_blocks()
+        for stage in range(len(block.intg.stages)):
+            block.forward(dt, stage)
 
-print("dt_max = ", dt_max)
-print("elapsed time = ", time.time() - start_time)
+        # evolve kinetics
+        u[index.icy:] += evolve_kinetics(block, kinet, thermo_x)
+
+        current_time += dt
+        count += 1
