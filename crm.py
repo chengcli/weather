@@ -20,7 +20,7 @@ from kintera import (
 torch.set_default_dtype(torch.float64)
 
 def evolve_kinetics(block, kinet, thermo_x):
-    eos = block.hydro.module("eos")
+    eos = block.module("hydro.eos")
     thermo_y = eos.named_modules()["thermo"]
 
     w = block.buffer("hydro.eos.W")
@@ -32,7 +32,7 @@ def evolve_kinetics(block, kinet, thermo_x):
     cp_vol = thermo_x.compute("TV->cp", (temp, conc))
 
     conc_kinet = kinet.options.narrow_copy(conc, thermo_y.options)
-    rate, rc_ddC, rd_ddT = kinet.forward(temp, pres, conc_kinet)
+    rate, rc_ddC, rc_ddT = kinet.forward(temp, pres, conc_kinet)
     jac = kinet.jacobian(temp, conc_kinet, cp_vol, rate, rc_ddC, rc_ddT)
 
     stoich = kinet.buffer("stoich")
@@ -50,9 +50,8 @@ def setup_initial_condition(block, thermo_x):
     grav = 9.8
 
     # get handles to modules
-    coord = block.hydro.module("coord")
-    eos = block.hydro.module("eos")
-    thermo_y = eos.named_modules()["thermo"]
+    coord = block.module("hydro.coord")
+    thermo_y = block.module("hydro.eos.thermo")
 
     # get coordinates
     x3v, x2v, x1v = torch.meshgrid(
@@ -111,24 +110,24 @@ if __name__ == '__main__':
     # create meshblock
     op_block = MeshBlockOptions.from_yaml(infile)
     block = MeshBlock(op_block)
-    block.to(device)
+    block.to(torch.device(device))
 
     # create thermo module
     op_thermo = ThermoOptions.from_yaml(infile)
     thermo_x = ThermoX(op_thermo)
-    thermo_x.to(device)
+    thermo_x.to(torch.device(device))
 
     # create kinetics module
     op_kinet = KineticsOptions.from_yaml(infile)
     kinet = Kinetics(op_kinet)
-    kinet.to(device)
+    kinet.to(torch.device(device))
 
     # create output fields
     op_out = OutputOptions().file_basename("earth")
     out2 = NetcdfOutput(op_out.fid(2).variable("prim"))
     out3 = NetcdfOutput(op_out.fid(3).variable("uov"))
     out4 = NetcdfOutput(op_out.fid(4).variable("diag"))
-    outs = [out2, out3, out4]
+    outs = [out2, out4]
 
     # set up initial condition
     w = setup_initial_condition(block, thermo_x)
